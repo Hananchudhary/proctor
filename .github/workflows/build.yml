@@ -1,4 +1,4 @@
-name: Build C++ for All OS
+name: Build Server and Client for All OS
 
 on: [push]
 
@@ -6,7 +6,7 @@ jobs:
   build:
     strategy:
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
 
     runs-on: ${{ matrix.os }}
 
@@ -14,13 +14,18 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      - name: Compile program
+      - name: Compile server
         run: |
-          g++ program.cpp -o program
-          if [ "$RUNNER_OS" == "Windows" ]; then mv program program.exe; fi
+          g++ server.cpp -o server
+          if [ "$RUNNER_OS" == "Windows" ]; then mv server server.exe; fi
 
-      - name: Upload artifact
+      - name: Compile client
+        run: |
+          g++ client.cpp -o client
+          if [ "$RUNNER_OS" == "Windows" ]; then mv client client.exe; fi
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v3
         with:
           name: program-${{ matrix.os }}
-          path: program*
+          path: server* client*
