@@ -25,7 +25,6 @@
 #include <algorithm>
 #include <csignal>
 #include <iomanip>
-#include <iomanip>
 
 #ifdef _WIN32
     #define WIN32_LEAN_AND_MEAN
@@ -85,15 +84,6 @@ static std::atomic<int> g_next_client_id{1};
 static ServerConfig g_config;
 
 // ============================================================================
-// Signal Handler
-// ============================================================================
-
-void signal_handler(int signum) {
-    std::cout << "\n[!] Signal " << signum << " received. Shutting down server...\n";
-    g_config.running.store(false);
-}
-
-// ============================================================================
 // Platform-Specific Socket Helpers
 // ============================================================================
 
@@ -108,6 +98,38 @@ void signal_handler(int signum) {
     #define CLOSE_SOCKET(s) close(s)
     #define SOCKET_ERROR_CODE errno
 #endif
+
+// ============================================================================
+// FIX #1 & #2: Self-pipe trick for signal-safe wakeup
+// When Ctrl+C fires, we write a byte to a pipe. The accept loop watches this
+// pipe via select(), so it wakes immediately instead of waiting up to 1 second.
+// This also ensures the server socket is closed promptly, which releases the
+// port so SO_REUSEADDR / SO_REUSEPORT can take effect on the next run.
+// ============================================================================
+
+#ifndef _WIN32
+static int g_wake_pipe[2] = {-1, -1};  // [0]=read end, [1]=write end
+#endif
+
+// ============================================================================
+// Signal Handler
+// ============================================================================
+
+void signal_handler(int signum) {
+    // Async-signal-safe: just flip the flag and poke the pipe
+    g_config.running.store(false);
+
+#ifndef _WIN32
+    if (g_wake_pipe[1] != -1) {
+        char byte = 1;
+        (void)write(g_wake_pipe[1], &byte, 1);  // wake up select()
+    }
+#endif
+
+    // Print is NOT async-signal-safe, but acceptable for a demo tool
+    const char* msg = "\n[!] Shutdown signal received. Stopping server...\n";
+    (void)write(STDERR_FILENO, msg, strlen(msg));
+}
 
 // ============================================================================
 // Server Class
@@ -125,13 +147,21 @@ public:
         std::cout << "[*] Initializing Exam Integrity Server...\n";
 
 #ifdef _WIN32
-        // Initialize Winsock
         WSADATA wsaData;
         if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
             std::cerr << "[ERROR] WSAStartup failed: " << WSAGetLastError() << "\n";
             return false;
         }
         std::cout << "[*] Winsock initialized\n";
+#else
+        // FIX #1: Create the self-pipe used to wake select() on shutdown
+        if (pipe(g_wake_pipe) < 0) {
+            std::cerr << "[ERROR] pipe() failed: " << strerror(errno) << "\n";
+            return false;
+        }
+        // Make both ends non-blocking
+        fcntl(g_wake_pipe[0], F_SETFL, O_NONBLOCK);
+        fcntl(g_wake_pipe[1], F_SETFL, O_NONBLOCK);
 #endif
 
         // Create socket
@@ -141,10 +171,17 @@ public:
             return false;
         }
 
-        // Set socket options (reuse address)
+        // FIX #2a: SO_REUSEADDR — allow immediate reuse after server exits
         int opt = 1;
         setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR,
                    reinterpret_cast<const char*>(&opt), sizeof(opt));
+
+#ifndef _WIN32
+        // FIX #2b: SO_REUSEPORT — on Linux this is needed too so a new
+        // process can bind the same port as soon as the old one closes
+        setsockopt(server_socket, SOL_SOCKET, SO_REUSEPORT,
+                   reinterpret_cast<const char*>(&opt), sizeof(opt));
+#endif
 
         // Bind to address
         sockaddr_in addr{};
@@ -170,7 +207,7 @@ public:
     void accept_clients() {
         std::cout << "[*] Waiting for client connections...\n";
 
-        // Set non-blocking for all platforms
+        // Set server socket non-blocking
 #ifdef _WIN32
         u_long mode = 1;
         ioctlsocket(server_socket, FIONBIO, &mode);
@@ -180,48 +217,68 @@ public:
 #endif
 
         while (config.running.load()) {
-            sockaddr_in client_addr{};
-            socklen_t client_len = sizeof(client_addr);
-
-#ifdef _WIN32
             fd_set read_fds;
             FD_ZERO(&read_fds);
             FD_SET(server_socket, &read_fds);
+
+            // FIX #1: Also watch the wake-pipe read-end so SIGINT wakes us
+            // immediately rather than waiting for the select() timeout.
+#ifndef _WIN32
+            FD_SET(g_wake_pipe[0], &read_fds);
+            int nfds = std::max((int)server_socket, g_wake_pipe[0]) + 1;
+#endif
 
             struct timeval timeout;
             timeout.tv_sec = 1;
             timeout.tv_usec = 0;
 
+#ifdef _WIN32
             int select_result = select(0, &read_fds, nullptr, nullptr, &timeout);
-            if (select_result > 0 && FD_ISSET(server_socket, &read_fds)) {
+#else
+            int select_result = select(nfds, &read_fds, nullptr, nullptr, &timeout);
 #endif
 
+            if (select_result < 0) {
+#ifndef _WIN32
+                if (errno == EINTR) continue;  // signal interrupted — recheck flag
+#endif
+                break;
+            }
+
+            if (!config.running.load()) break;
+
+#ifndef _WIN32
+            // Drain the wake-pipe (we only needed the wakeup)
+            if (g_wake_pipe[0] != -1 && FD_ISSET(g_wake_pipe[0], &read_fds)) {
+                char buf[16];
+                while (read(g_wake_pipe[0], buf, sizeof(buf)) > 0) {}
+                break;  // running flag is already false
+            }
+#endif
+
+            if (!FD_ISSET(server_socket, &read_fds)) continue;
+
+            sockaddr_in client_addr{};
+            socklen_t client_len = sizeof(client_addr);
             socket_t client_socket = accept(server_socket, (sockaddr*)&client_addr, &client_len);
 
             if (client_socket == INVALID_SOCKET_HANDLE) {
 #ifdef _WIN32
-                if (!config.running.load()) break;
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                continue;
+                int err = WSAGetLastError();
+                if (err == WSAEWOULDBLOCK) continue;
 #else
-                if (errno == EWOULDBLOCK || errno == EAGAIN) {
-                    if (!config.running.load()) break;
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                    continue;
-                }
+                if (errno == EWOULDBLOCK || errno == EAGAIN) continue;
                 std::cerr << "[ERROR] Accept failed: " << strerror(errno) << "\n";
-                continue;
 #endif
+                continue;
             }
 
-            // Get client info
             char client_ip[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
             int client_port = ntohs(client_addr.sin_port);
 
             std::cout << "[+] New connection from " << client_ip << ":" << client_port << "\n";
 
-            // Create client info
             int client_id = g_next_client_id.fetch_add(1);
             ClientInfo info;
             info.client_id = client_id;
@@ -231,19 +288,15 @@ public:
             info.is_active = true;
             info.connected_at = std::chrono::steady_clock::now();
 
-            // Store in map
             {
                 std::lock_guard<std::mutex> lock(g_clients_mutex);
                 g_clients[client_id] = info;
             }
 
-            // Start client handler thread
             std::thread(&ExamServer::handle_client, this, client_id).detach();
-
-#ifdef _WIN32
-            }
-#endif
         }
+
+        std::cout << "[*] Accept loop exited.\n";
     }
 
     void handle_client(int client_id) {
@@ -251,14 +304,11 @@ public:
         {
             std::lock_guard<std::mutex> lock(g_clients_mutex);
             auto it = g_clients.find(client_id);
-            if (it == g_clients.end()) {
-                return;
-            }
+            if (it == g_clients.end()) return;
             info = &it->second;
         }
 
         char buffer[1024];
-        bool got_student_id = false;
 
         while (config.running.load() && info->is_active) {
             int n = recv(info->socket, buffer, sizeof(buffer) - 1, 0);
@@ -271,22 +321,15 @@ public:
             buffer[n] = '\0';
             std::string msg(buffer);
 
-            // Trim trailing whitespace
-            while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r' || msg.back() == ' ')) {
+            while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r' || msg.back() == ' '))
                 msg.pop_back();
-            }
 
             std::cout << "[Client " << client_id << "] Received: " << msg << "\n";
 
-            // Parse message
             if (msg.rfind("STUDENT_ID:", 0) == 0) {
                 std::string student_id = msg.substr(11);
                 info->student_id = student_id;
-                got_student_id = true;
-
                 std::cout << "[Client " << client_id << "] StudentID: " << student_id << "\n";
-
-                // Update client info in map
                 {
                     std::lock_guard<std::mutex> lock(g_clients_mutex);
                     g_clients[client_id] = *info;
@@ -294,10 +337,8 @@ public:
             }
         }
 
-        // Mark as inactive
         info->is_active = false;
         CLOSE_SOCKET(info->socket);
-
         std::cout << "[!] Client " << client_id << " (" << info->student_id << ") disconnected\n";
     }
 
@@ -311,7 +352,6 @@ public:
 
         const char* stop_msg = "STOP\n";
         int result = send(it->second.socket, stop_msg, strlen(stop_msg), 0);
-
         if (result < 0) {
             std::cerr << "[ERROR] Failed to send STOP to client " << client_id << "\n";
             return false;
@@ -349,8 +389,7 @@ public:
         std::cout << "============================================================\n";
         std::cout << "                  EXAM INTEGRITY SERVER                     \n";
         std::cout << "                      Student Dashboard                     \n";
-        std::cout << "============================================================\n";
-        std::cout << "\n";
+        std::cout << "============================================================\n\n";
 
         if (g_clients.empty()) {
             std::cout << "  No clients connected.\n";
@@ -367,28 +406,23 @@ public:
             }
         }
 
-        std::cout << "\n";
-        std::cout << "  Total clients: " << g_clients.size() << "\n";
-        std::cout << "  Active clients: ";
         int active = 0;
-        for (const auto& [id, info] : g_clients) {
+        for (const auto& [id, info] : g_clients)
             if (info.is_active) active++;
-        }
-        std::cout << active << "\n";
-        std::cout << "============================================================\n";
-        std::cout << "\n";
+
+        std::cout << "\n  Total clients: " << g_clients.size() << "\n";
+        std::cout << "  Active clients: " << active << "\n";
+        std::cout << "============================================================\n\n";
     }
 
     void cleanup() {
         std::cout << "[*] Cleaning up server...\n";
 
-        // Close all client sockets
         {
             std::lock_guard<std::mutex> lock(g_clients_mutex);
             for (auto& [id, info] : g_clients) {
-                if (info.socket != INVALID_SOCKET_HANDLE) {
+                if (info.socket != INVALID_SOCKET_HANDLE)
                     CLOSE_SOCKET(info.socket);
-                }
             }
             g_clients.clear();
         }
@@ -397,6 +431,12 @@ public:
             CLOSE_SOCKET(server_socket);
             server_socket = INVALID_SOCKET_HANDLE;
         }
+
+#ifndef _WIN32
+        // Close wake-pipe
+        if (g_wake_pipe[0] != -1) { close(g_wake_pipe[0]); g_wake_pipe[0] = -1; }
+        if (g_wake_pipe[1] != -1) { close(g_wake_pipe[1]); g_wake_pipe[1] = -1; }
+#endif
 
 #ifdef _WIN32
         WSACleanup();
@@ -411,61 +451,93 @@ public:
 // ============================================================================
 
 void print_help() {
-    std::cout << "\n";
-    std::cout << "Available Commands:\n";
+    std::cout << "\nAvailable Commands:\n";
     std::cout << "  dashboard     - Show all connected students\n";
     std::cout << "  stop <id>     - Stop specific client by ID\n";
     std::cout << "  stopall       - Stop all active clients\n";
     std::cout << "  list          - Alias for dashboard\n";
     std::cout << "  help          - Show this help\n";
-    std::cout << "  quit          - Shutdown server and exit\n";
-    std::cout << "\n";
+    std::cout << "  quit          - Shutdown server and exit\n\n";
 }
 
+// FIX #1: The original interactive_loop called std::getline() which blocks
+// indefinitely. When Ctrl+C fires the signal handler sets running=false but
+// getline() never returns, so the main thread hangs.
+//
+// Fix: use select() to wait on stdin with a short timeout so we check the
+// running flag regularly. When the flag is false we exit without waiting for
+// user input.
 void interactive_loop(ExamServer& server) {
-    std::cout << "\n";
-    std::cout << "[*] Entering interactive command mode.\n";
-    std::cout << "[*] Type 'help' for available commands.\n";
-    std::cout << "\n";
+    std::cout << "\n[*] Entering interactive command mode.\n";
+    std::cout << "[*] Type 'help' for available commands.\n\n";
 
-    std::string line;
     while (g_config.running.load()) {
-        std::cout << "server> ";
-        std::getline(std::cin, line);
 
-        // Parse command
+#ifdef _WIN32
+        // Windows: use WaitForSingleObject on stdin handle
+        HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
+        DWORD wait_result = WaitForSingleObject(hStdin, 500);  // 500ms
+        if (wait_result == WAIT_TIMEOUT) continue;
+        if (!g_config.running.load()) break;
+#else
+        // Unix: use select() on stdin (fd 0) with 500ms timeout
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(STDIN_FILENO, &read_fds);
+
+        struct timeval tv;
+        tv.tv_sec = 0;
+        tv.tv_usec = 500000;  // 500ms
+
+        int sel = select(STDIN_FILENO + 1, &read_fds, nullptr, nullptr, &tv);
+        if (sel < 0) {
+            if (errno == EINTR) continue;  // signal — re-check flag
+            break;
+        }
+        if (sel == 0) continue;  // timeout — re-check flag
+        if (!FD_ISSET(STDIN_FILENO, &read_fds)) continue;
+#endif
+
+        std::string line;
+        if (!std::getline(std::cin, line)) {
+            // EOF (e.g. stdin closed)
+            g_config.running.store(false);
+            break;
+        }
+
         std::istringstream iss(line);
         std::string cmd;
         iss >> cmd;
 
         if (cmd.empty()) continue;
 
-        // Convert to lowercase
         std::transform(cmd.begin(), cmd.end(), cmd.begin(), ::tolower);
 
         if (cmd == "dashboard" || cmd == "list") {
             server.show_dashboard();
-        }
-        else if (cmd == "stop") {
+        } else if (cmd == "stop") {
             int client_id;
             if (iss >> client_id) {
                 server.send_stop_command(client_id);
             } else {
                 std::cerr << "[ERROR] Usage: stop <client_id>\n";
             }
-        }
-        else if (cmd == "stopall") {
+        } else if (cmd == "stopall") {
             server.send_stop_all();
-        }
-        else if (cmd == "help") {
+        } else if (cmd == "help") {
             print_help();
-        }
-        else if (cmd == "quit" || cmd == "exit") {
+        } else if (cmd == "quit" || cmd == "exit") {
             std::cout << "[*] Shutting down...\n";
             g_config.running.store(false);
+#ifndef _WIN32
+            // Poke the accept thread so it wakes up immediately
+            if (g_wake_pipe[1] != -1) {
+                char byte = 1;
+                (void)write(g_wake_pipe[1], &byte, 1);
+            }
+#endif
             break;
-        }
-        else {
+        } else {
             std::cerr << "[ERROR] Unknown command: " << cmd << "\n";
             std::cerr << "      Type 'help' for available commands.\n";
         }
@@ -477,32 +549,24 @@ void interactive_loop(ExamServer& server) {
 // ============================================================================
 
 int main(int argc, char* argv[]) {
-    // Setup signal handlers
-    signal(SIGINT, signal_handler);
+    signal(SIGINT,  signal_handler);
     signal(SIGTERM, signal_handler);
 
 #ifdef _WIN32
     signal(SIGBREAK, signal_handler);
 #endif
 
-    // Parse command line args
     int port = 8888;
-    if (argc >= 2) {
-        port = std::atoi(argv[1]);
-    }
-
+    if (argc >= 2) port = std::atoi(argv[1]);
     g_config.port = port;
 
     std::cout << "\n";
     std::cout << "============================================================\n";
     std::cout << "           EXAM INTEGRITY SERVER - NETWORK BLOCKER          \n";
-    std::cout << "============================================================\n";
-    std::cout << "\n";
+    std::cout << "============================================================\n\n";
     std::cout << "[*] Server port: " << port << "\n";
-    std::cout << "[*] Max clients: " << g_config.max_clients << "\n";
-    std::cout << "\n";
+    std::cout << "[*] Max clients: " << g_config.max_clients << "\n\n";
 
-    // Initialize server
     ExamServer server(g_config);
     if (!server.initialize()) {
         std::cerr << "[ERROR] Failed to initialize server.\n";
@@ -510,22 +574,26 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Start client acceptor thread
+    // Start accept thread
     std::thread acceptor_thread([&server]() {
         server.accept_clients();
     });
 
-    // Run interactive command loop
+    // Run interactive loop (exits promptly on Ctrl+C now)
     interactive_loop(server);
 
-    // Wait for acceptor thread
+    // Signal accept thread to stop and wait
     g_config.running.store(false);
-    if (acceptor_thread.joinable()) {
-        acceptor_thread.join();
+#ifndef _WIN32
+    if (g_wake_pipe[1] != -1) {
+        char byte = 1;
+        (void)write(g_wake_pipe[1], &byte, 1);
     }
+#endif
 
-    // Cleanup
+    if (acceptor_thread.joinable())
+        acceptor_thread.join();
+
     server.cleanup();
-
     return 0;
 }
