@@ -24,8 +24,16 @@ jobs:
           g++ client.cpp -o client
           if [ "$RUNNER_OS" == "Windows" ]; then mv client client.exe; fi
 
-      - name: Upload artifacts
+      - name: Zip executables
+        run: |
+          if [ "$RUNNER_OS" == "Windows" ]; then
+            powershell Compress-Archive -Path server.exe,client.exe -DestinationPath server-client-windows.zip
+          else
+            zip server-client-${{ matrix.os }} server* client*
+          fi
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v3
         with:
-          name: program-${{ matrix.os }}
-          path: server* client*
+          name: server-client-${{ matrix.os }}
+          path: server-client-*.zip
